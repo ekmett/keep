@@ -17,10 +17,12 @@ library
     bytestring,
     cryptohash-sha256 >= 0.11,
     distributed-closure ^>= 0.4,
+    hashable,
     hedis,
-    lens,
     mtl,
+    time,
     transformers,
+    unliftio-core,
     utf8-string,
     uuid >= 1.2.6 && < 1.4
 
