@@ -7,7 +7,7 @@ module Control.Keep.Internal where
 
 import Control.Distributed.Closure
 import Control.Exception (Exception(..), catch, throwIO)
-import Control.Monad (join, unless)
+import Control.Monad (join, unless, when)
 import Control.Monad.IO.Unlift
 import Control.Monad.Trans.Reader
 import Crypto.Hash.SHA256 as Crypto
@@ -38,17 +38,20 @@ import GHC.Stack
 data Mode
   = Play
   { _playbackLog :: {-# unpack #-} !(IORef [ByteString])
-  , ctx :: ByteString
+  , currentContext :: ByteString
+  , currentClientId :: Integer
   , trusting :: Bool
   }
   | Record
   { _recordingTrace :: ByteString
   , _path :: ByteString -- canonical name for the current trace
-  , ctx :: ByteString
+  , currentContext :: ByteString
+  , currentClientId :: Integer
   , trusting :: Bool -- local trace id, canonical path hash, trusting?
   }
   | Stop -- trusting?
-  { ctx :: ByteString
+  { currentContext :: ByteString
+  , currentClientId :: Integer
   , trusting :: Bool
   }
 
@@ -67,6 +70,9 @@ localKeep f m = keep \e -> unKeep m (f e)
 
 unKeep :: Keep a -> Mode -> Redis a
 unKeep (Keep m) = runReaderT m
+
+clientId :: RedisCtx m f => m (f Integer)
+clientId = sendRequest ["CLIENT","ID"]
 
 -- locally disable cache trust
 verify :: Keep a -> Keep a
@@ -90,24 +96,35 @@ throwM :: (MonadIO m, Exception e) => e -> m a
 throwM = liftIO . throwIO
 
 check :: Redis (Either Reply b) -> Redis b
-check m = do
-  m >>= \case
-    Left e -> throwM $ RedisError e
-    Right a -> pure a
+check m = m >>= \case
+  Left e -> throwM $ RedisError e
+  Right a -> pure a
+
+checkTx :: RedisTx (Queued b) -> Redis b
+checkTx m = multiExec m >>= \case
+  TxError e -> throwM $ RedisError $ Error $ UTF8.fromString e
+  TxAborted -> throwM $ RedisError $ Error "aborted"
+  TxSuccess a -> pure a
+
 
 unsafeRedis :: Redis a -> Keep a
 unsafeRedis m = keep \_ -> m
 
-warn :: HasCallStack => String -> Redis ()
-warn s = do
+logging :: HasCallStack => (CallStack -> CallStack) -> String -> String -> Redis ()
+logging edit level s = do
   t <- liftIO getCurrentTime
   let cs :: [String]
-      cs = Prelude.drop 1 $ Prelude.lines $ prettyCallStack $ popCallStack callStack
+      cs = Prelude.drop 1 $ Prelude.lines $ prettyCallStack $ edit callStack
       s' :: String
-      s' = Prelude.unlines $ (show t ++ " warning: "  ++ s) : cs
+      s' = Prelude.unlines $ (show t ++ " " ++ level ++ ": "  ++ s) : cs
 
   liftIO $ Prelude.putStr s'
   () <$ check (rpush "keep.log" [UTF8.fromString s'])
+
+warn, err, note :: HasCallStack => String -> Redis ()
+warn = logging (popCallStack . popCallStack) "warning"
+err = logging (popCallStack . popCallStack) "error"
+note = logging (popCallStack . popCallStack) "note"
 
 withRunRedisInIO :: ((forall a. Redis a -> IO a) -> IO b) -> Redis b
 withRunRedisInIO inner = Redis $ withRunInIO \run -> inner (run . unRedis)
@@ -118,10 +135,10 @@ withRunRedisInIO inner = Redis $ withRunInIO \run -> inner (run . unRedis)
 
 -- closures are roots
 closed :: (HasCallStack, Typeable a) => Closure (Keep a) -> Keep a
-closed c = keep \e -> closedPath (ctx e) (ctx e <> ":" <> hashEncode c) (trusting e) (unclosure c)
+closed c = keep \e -> closedPath (currentContext e) (currentClientId e) (currentContext e <> ":" <> hashEncode c) (trusting e) (unclosure c)
 
-closedPath :: HasCallStack => ByteString -> ByteString -> Bool -> Keep a -> Redis a
-closedPath c p t m = check (lrange p 0 (-1)) >>= \trace -> if Prelude.null trace
+closedPath :: HasCallStack => ByteString -> Integer -> ByteString -> Bool -> Keep a -> Redis a
+closedPath c cid p t m = check (lrange p 0 (-1)) >>= \trace -> if Prelude.null trace
   then record
   else do
     withRunRedisInIO \io -> io (play trace)
@@ -132,13 +149,25 @@ closedPath c p t m = check (lrange p 0 (-1)) >>= \trace -> if Prelude.null trace
   where
     play trace = do
       r <- liftIO $ newIORef (Prelude.tail trace)
-      unKeep m $ Play r c t
+      note $ "playing " <> show p <> " in " <> show c <> " started"
+      result <- unKeep m $ Play r c cid t
+      note $ "playing " <> show p <> " in " <> show c <> " complete"
+      pure result
     record = do
       k <- freshTrace
-      check $ lpush k [p] -- allows us to identify the trace
-      a <- unKeep m $ Record k p c t
-      check $ rename k p
-      a <$ check (lset k 0 "") -- might as well cleanup
+      let traces   = c <> ".traces"
+      let closures = c <> ".closures"
+      checkTx do
+        hsetnx traces k $ UTF8.fromString $ show cid
+        lpush k [p] -- allows us to identify the trace
+      note $ "recording " <> show p <> " as UUID " <> show k <> " in " <> show c <> " started"
+      a <- unKeep m $ Record k p c cid t
+      note $ "recording " <> show p <> " as UUID " <> show k <> " in " <> show c <> " complete"
+      a <$ checkTx do
+        rename k p
+        hdel traces [k]
+        hset closures p ""
+        lset p 0 ""
 
 next :: MonadIO m => IORef [ByteString] -> m ByteString
 next r = liftIO $ join $ atomicModifyIORef r \case
@@ -149,34 +178,42 @@ next r = liftIO $ join $ atomicModifyIORef r \case
 -- but if you don't trust, you can still verify the subtrace
 checkpoint :: Binary a => Keep a -> Keep a
 checkpoint m = keep \case
-  Play r c trusting -> do
+  Play r c cid trusting -> do
     p <- next r
     v <- next r
     if trusting
     then pure (decodeStrict v)
     else do
-      a <- closedPath c p trusting m
+      a <- closedPath c cid p trusting m
       a <$ liftIO do
         unless (Binary.encode a == Lazy.fromStrict v) $ throwIO $ BadTrace "checkpoint result mismatch"
-  Record t p c trusting -> do
+  Record t p c cid trusting -> do
     i <- check $ llen t -- current computation index
     let p' = c <> ":" <> Crypto.hash (p <> ":" <> Char8.pack (show i))
     check $ rpush t [p']
-    a <- closedPath c p' trusting m
+    a <- closedPath c cid p' trusting m
     a <$ check (rpush t [encodeStrict a])
   s@Stop{} -> unKeep m s -- can't checkpoint while stopped
 
 -- run a trusted computation on redis
 --
--- If you don't trust the result's you'll get back from the database, you can @'runKeep' ctx . 'verify'@
+-- If you don't trust the result's you'll get back from the database, you can @'runKeep' ctx desc . 'verify'@
 -- and we'll verify the results
 --
 -- The context should uniquely define the executable StaticPtrs we'll encounter
 -- it can be a hash of the executable name, or a hash of the set of dependencies if you share closures
--- across a wider set of executables, etc.
-runKeep :: ByteString -> Keep a -> Redis a
-runKeep c m = unKeep m (Stop c True)
-
+-- across a wider set of executables, etc. It is not allowed to contain spacds
+runKeep :: ByteString -> ByteString -> Keep a -> Redis a
+runKeep c description m = do
+  when (Char8.elem ' ' c) $ fail "malformed context id"
+  uuid <- liftIO V4.nextRandom
+  let clientName = c <> ":" <> UUID.toASCIIBytes uuid -- so we can complain if we go to delete an active context or trace
+  clientId <- checkTx do
+    hset "keep.contexts" c description
+    clientSetname clientName
+    clientId
+  unKeep m $ Stop c clientId True
+ 
 merkle :: Binary a => a -> Keep (Merkle a)
 merkle a = keep \case
   Play{} -> pure $ Local a h
@@ -193,7 +230,7 @@ getAndRPush t h = check (Redis.get h) >>= \case
 
 unmerkle :: Binary a => Merkle a -> Keep a
 unmerkle (Remote h) = keep \case
-  Play r _ trusting -> liftIO $ do
+  Play r _ _ trusting -> liftIO $ do
     v <- next r
     unless trusting do
       let hv = Crypto.hash v
@@ -201,14 +238,14 @@ unmerkle (Remote h) = keep \case
     case decodeOrFail (Lazy.fromStrict v) of
       Left (_,_,msg) -> throwIO $ BadTrace msg
       Right (_,_,a) -> pure a
-  Record t _ _ _ -> decodeStrict <$> getAndRPush t h
-  Stop _ _ -> check (Redis.get h) >>= \case
+  Record t _ _ _ _ -> decodeStrict <$> getAndRPush t h
+  Stop _ _ _ -> check (Redis.get h) >>= \case
     Nothing -> throwM $ BadTrace $ "store missing key " <> show h
     Just v -> pure $ decodeStrict v
 unmerkle (Local a h) = keep \case
-  Stop _ _ -> pure a
-  Record t _ _ _ -> a <$ check (rpush t [encodeStrict a])
-  Play r _ trusting -> next r >>= \v -> liftIO $ if trusting
+  Stop _ _ _ -> pure a
+  Record t _ _ _ _ -> a <$ check (rpush t [encodeStrict a])
+  Play r _ _ trusting -> next r >>= \v -> liftIO $ if trusting
     then pure a
     else do
       let hv = Crypto.hash v
