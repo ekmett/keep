@@ -40,4 +40,11 @@ executable keep
   build-depends:
     keep,
     optparse-applicative ^>= 0.15.1
-  main-is: app/keep.hs
+  main-is: keep.hs
+
+executable example
+  import: common
+  build-depends:
+    keep
+  main-is: example.hs
+ 
