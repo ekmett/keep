@@ -14,24 +14,22 @@ f <.> g = (.) <$> f <*> g
 
 parseConnection :: Parser (IO Connection)
 parseConnection = connectWith <$> uri <*> fieldByField where
-  uri = optional $ parseConnectInfo <$> strOption (long "uri" <> metavar "URI" <> help "redis connect uri")
+  uri = parseConnectInfo <$> strOption (long "uri" <> metavar "URI" <> showDefault <> value "redis://localhost:6379/" <> help "redis connect uri")
 
   fieldByField = host <.> port <.> password -- database <.> maxConnections <.> maxIdleTime <*> connectTimeout <.> tlsParams TODO
-  host = by (\a m -> m { connectHost = a }) do
-    strOption (long "host" <> metavar "HOST" <> value "localhost" <> showDefault <> help "host")
+  host = by (\a m -> m { connectHost = a }) $ strOption (long "host" <> metavar "HOST" <> help "host")
 
   port = by (\a m -> m { connectPort = a }) $
         UnixSocket <$> strOption (long "socket" <> metavar "SOCKET" <> help "unix socket")
-    <|> PortNumber <$> option auto (long "port" <> metavar "PORT" <> value 6379 <> showDefault <> help "port")
+    <|> PortNumber <$> option auto (long "port" <> showDefault <> help "port")
 
   password = by (\a m -> m { connectAuth = a }) $ Just <$> strOption (long "password" <> metavar "PASSWORD" <> help "password")
            
   by :: (a -> ConnectInfo -> ConnectInfo) -> Parser a -> Parser (ConnectInfo -> ConnectInfo)
   by f p = maybe id f <$> optional p
 
-  connectWith (Just (Left uriError)) _ = fail uriError
-  connectWith (Just (Right ci))      p = checkedConnect $ p ci
-  connectWith Nothing                p = checkedConnect $ p defaultConnectInfo
+  connectWith (Left uriError) _ = fail uriError
+  connectWith (Right ci)      p = checkedConnect $ p ci
 
 
 -- sketch of an interface
@@ -110,7 +108,8 @@ parser = (,) <$> parseConnection <*> parseCommand
 
 main :: IO ()
 main = do
-  (connector, command) <- customExecParser (prefs showHelpOnEmpty) $ info (parser <**> helper) $ 
+  (connector, command) <- customExecParser (prefs $ showHelpOnEmpty <> subparserInline) $
+    info (parser <**> helper) $ 
        fullDesc
     <> progDesc "Keep command line tool"
     <> header "keep - distributed persistent computation"
