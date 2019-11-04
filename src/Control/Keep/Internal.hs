@@ -13,6 +13,7 @@ import Control.Monad.Trans.Reader
 import Crypto.Hash.SHA256 as Crypto
 import Data.Binary as Binary
 import Data.ByteString as Strict
+import Data.ByteString.Base64 as Base64
 import qualified Data.ByteString.Lazy as Lazy
 import Data.ByteString.Char8 as Char8
 import Data.ByteString.UTF8 as UTF8
@@ -27,6 +28,7 @@ import Data.UUID.V4 as V4
 import Database.Redis as Redis
 import Database.Redis.Core.Internal
 import GHC.Stack
+import Text.Read (readPrec)
 
 -- redis state:
 
@@ -135,7 +137,7 @@ withRunRedisInIO inner = Redis $ withRunInIO \run -> inner (run . unRedis)
 
 -- closures are roots
 closed :: (HasCallStack, Typeable a) => Closure (Keep a) -> Keep a
-closed c = keep \e -> closedPath (currentContext e) (currentClientId e) (currentContext e <> ":" <> hashEncode c) (trusting e) (unclosure c)
+closed c = keep \e -> closedPath (currentContext e) (currentClientId e) (currentContext e <> ":" <> Base64.encode (hashEncode c)) (trusting e) (unclosure c)
 
 closedPath :: HasCallStack => ByteString -> Integer -> ByteString -> Bool -> Keep a -> Redis a
 closedPath c cid p t m = check (lrange p 0 (-1)) >>= \trace -> if Prelude.null trace
@@ -189,7 +191,7 @@ checkpoint m = keep \case
         unless (Binary.encode a == Lazy.fromStrict v) $ throwIO $ BadTrace "checkpoint result mismatch"
   Record t p c cid trusting -> do
     i <- check $ llen t -- current computation index
-    let p' = c <> ":" <> Crypto.hash (p <> ":" <> Char8.pack (show i))
+    let p' = c <> ":" <> Base64.encode (Crypto.hash (p <> ":" <> Char8.pack (show i)))
     check $ rpush t [p']
     a <- closedPath c cid p' trusting m
     a <$ check (rpush t [encodeStrict a])
@@ -213,20 +215,32 @@ runKeep c description m = do
     clientSetname clientName
     clientId
   unKeep m $ Stop c clientId True
- 
+
+-- 262k buckets
+pattern BUCKET_CHARS = 3
+
 merkle :: Binary a => a -> Keep (Merkle a)
 merkle a = keep \case
   Play{} -> pure $ Local a h
-  _      -> Local a h <$ check (setnx h v)
+  _      -> Local a h <$ check (hsetnx bucket bin v)
  where
-   v = Lazy.toStrict $ encode a
+   v = Lazy.toStrict $ Binary.encode a
    h = Crypto.hash v
+   h64 = Base64.encode h
+   (bucket,bin) = split64 h64
 
 -- TODO: compile into a lua script we can eval redis-side to remove a round trip
-getAndRPush :: ByteString -> ByteString -> Redis ByteString
-getAndRPush t h = check (Redis.get h) >>= \case
-  Nothing -> throwM $ BadTrace $ "store missing key " <> show h
-  Just v -> v <$ check (rpush t [v])
+hgetAndRPush :: ByteString -> ByteString -> Redis ByteString
+hgetAndRPush t h = do
+  let h64 = Base64.encode h
+      (bucket, bin) = split64 h64
+  check (Redis.hget bucket bin) >>= \case
+    Nothing -> throwM $ BadTrace $ "store missing key " <> show h64
+    Just v -> v <$ check (rpush t [v])
+
+split64 :: ByteString -> (ByteString,ByteString)
+split64 h64 = ("m:" <> bucket, bin)
+  where (bucket,bin) = Char8.splitAt BUCKET_CHARS h64
 
 unmerkle :: Binary a => Merkle a -> Keep a
 unmerkle (Remote h) = keep \case
@@ -234,14 +248,17 @@ unmerkle (Remote h) = keep \case
     v <- next r
     unless trusting do
       let hv = Crypto.hash v
-      throwIO $ BadTrace $ "hash mismatch " <> show h <> " /= " <> show hv
+      when (v /= hv) $ throwIO $ BadTrace $ "hash mismatch " <> show (Base64.encode h) <> " /= " <> show (Base64.encode hv)
     case decodeOrFail (Lazy.fromStrict v) of
       Left (_,_,msg) -> throwIO $ BadTrace msg
       Right (_,_,a) -> pure a
-  Record t _ _ _ _ -> decodeStrict <$> getAndRPush t h
-  Stop _ _ _ -> check (Redis.get h) >>= \case
-    Nothing -> throwM $ BadTrace $ "store missing key " <> show h
-    Just v -> pure $ decodeStrict v
+  Record t _ _ _ _ -> decodeStrict <$> hgetAndRPush t h
+  Stop _ _ _ -> do
+    let h64 = Base64.encode h
+        (bucket,bin) = split64 h64
+    check (Redis.hget bucket bin) >>= \case
+      Nothing -> throwM $ BadTrace $ "store missing key " <> show h64
+      Just v -> pure $ decodeStrict v
 unmerkle (Local a h) = keep \case
   Stop _ _ _ -> pure a
   Record t _ _ _ _ -> a <$ check (rpush t [encodeStrict a])
@@ -249,7 +266,7 @@ unmerkle (Local a h) = keep \case
     then pure a
     else do
       let hv = Crypto.hash v
-      unless (hv == h) $ throwIO $ BadTrace $ "hash mismatch " <> show h <> " /= " <> show hv
+      unless (hv == h) $ throwIO $ BadTrace $ "hash mismatch " <> show (Base64.encode h) <> " /= " <> show (Base64.encode hv)
       case decodeOrFail (Lazy.fromStrict v) of
         Left (_,_,msg) -> throwIO $ BadTrace msg
         Right (_,_,a') -> pure a'
@@ -276,3 +293,11 @@ instance Binary (Merkle a) where
   put (Local _ h) = put h
   put (Remote h) = put h
   get = Remote <$> Binary.get
+
+instance Show (Merkle a) where
+  showsPrec d = showsPrec d . Base64.encode . hashMerkle
+
+instance Read (Merkle a) where
+  readPrec = readPrec >>= \case
+    Left e -> fail e
+    Right a -> pure a

@@ -15,18 +15,19 @@ common common
   build-depends:
     base >= 4.12,
     hedis ^>= 0.12.9,
+    binary ^>= 0.8.7,
     bytestring ^>= 0.10,
+    hashable >= 1.2 && < 1.4,
+    transformers ^>= 0.5.6.2,
     utf8-string ^>= 1.0.1.1
 
 library
   import: common
   build-depends:
-    binary ^>= 0.8.7,
+    base64-bytestring ^>= 1.0.0.2,
     cryptohash-sha256 >= 0.11,
     distributed-closure ^>= 0.4,
-    hashable >= 1.2 && < 1.4,
     time >= 1.4.1 && < 1.10,
-    transformers ^>= 0.5.6.2 ,
     unliftio-core ^>= 0.1.2,
     uuid >= 1.2.6 && < 1.4
 
