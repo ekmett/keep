@@ -8,6 +8,7 @@ module Control.Keep.Internal where
 import Control.Distributed.Closure
 import Control.Exception (Exception(..), catch, throwIO)
 import Control.Monad (join, unless, when)
+import Control.Monad.Fail as Fail
 import Control.Monad.IO.Unlift
 import Control.Monad.Trans.Reader
 import Crypto.Hash.SHA256 as Crypto
@@ -64,6 +65,9 @@ newtype Keep a = Keep (ReaderT Mode Redis a)
   deriving stock (Functor)
   deriving newtype (Applicative,Monad)
 
+instance MonadFail Keep where
+  fail s = keep \_ -> liftIO (Fail.fail s)
+
 keep :: (Mode -> Redis a) -> Keep a
 keep = Keep . ReaderT
 
@@ -107,7 +111,6 @@ checkTx m = multiExec m >>= \case
   TxError e -> throwM $ RedisError $ Error $ UTF8.fromString e
   TxAborted -> throwM $ RedisError $ Error "aborted"
   TxSuccess a -> pure a
-
 
 unsafeRedis :: Redis a -> Keep a
 unsafeRedis m = keep \_ -> m

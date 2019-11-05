@@ -3,6 +3,7 @@
   DerivingStrategies, LambdaCase #-}
 import Control.Keep
 import Control.Monad.IO.Class
+import Control.Monad.Fail as Fail
 import Data.Binary as Binary
 import Data.Hashable
 import Database.Redis
@@ -27,5 +28,5 @@ main = do
       Bin 4 y z -> do
         y' <- unmerkle y
         liftIO $ print y'
-      Tip -> fail "bad"
+      Tip -> Fail.fail "bad"
     return ()
