@@ -210,7 +210,7 @@ checkpoint m = keep \case
 -- across a wider set of executables, etc. It is not allowed to contain spacds
 runKeep :: ByteString -> ByteString -> Keep a -> Redis a
 runKeep c description m = do
-  when (Char8.elem ' ' c) $ fail "malformed context id"
+  when (Char8.elem ' ' c) $ Fail.fail "malformed context id"
   uuid <- liftIO V4.nextRandom
   let clientName = c <> ":" <> UUID.toASCIIBytes uuid -- so we can complain if we go to delete an active context or trace
   clientId <- checkTx do
@@ -302,5 +302,5 @@ instance Show (Merkle a) where
 
 instance Read (Merkle a) where
   readPrec = readPrec >>= \case
-    Left e -> fail e
+    Left e -> Fail.fail e
     Right a -> pure a
